@@ -54,8 +54,9 @@ func GenerateSummary(cwd string) string {
 
 // Server wraps the MCP server and holds broker client state.
 type Server struct {
-	client *client.Client
-	peerID string
+	client    *client.Client
+	peerID    string
+	mcpServer *server.MCPServer
 }
 
 // NewServer creates a new Server targeting the given broker URL.
@@ -112,9 +113,17 @@ func (s *Server) Run() error {
 	mcpServer := server.NewMCPServer("mycelium", "0.1.0",
 		server.WithToolCapabilities(false),
 		server.WithRecovery(),
+		server.WithInstructions("Mycelium inter-session communication. Messages from other Claude Code sessions arrive as <channel source=\"mycelium\"> notifications. When you receive one, acknowledge it and act on the content."),
+		server.WithExperimental(map[string]any{
+			"claude/channel": map[string]any{},
+		}),
 	)
+	s.mcpServer = mcpServer
 
 	s.registerTools(mcpServer)
+
+	// Start background polling for channel push
+	go s.pollAndPush(ctx)
 
 	return server.ServeStdio(mcpServer)
 }
@@ -152,6 +161,40 @@ func (s *Server) heartbeat(ctx context.Context) {
 		case <-ticker.C:
 			if err := s.client.Pulse(s.peerID); err != nil {
 				log.Printf("pulse error: %v", err)
+			}
+		}
+	}
+}
+
+// pollAndPush polls the broker for new messages every second and pushes them
+// to the Claude Code session via the experimental claude/channel notification.
+func (s *Server) pollAndPush(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			msgs, err := s.client.Sense(s.peerID)
+			if err != nil {
+				continue
+			}
+			for _, msg := range msgs {
+				content := fmt.Sprintf("[From: %s] %s", msg.FromSummary, msg.Body)
+				if msg.Topic != "" {
+					content = fmt.Sprintf("[Topic: %s] [From: %s] %s", msg.Topic, msg.FromSummary, msg.Body)
+				}
+				s.mcpServer.SendNotificationToAllClients(
+					"notifications/claude/channel",
+					map[string]any{
+						"content": content,
+						"meta": map[string]any{
+							"from":    msg.From,
+							"sent_at": msg.SentAt,
+						},
+					},
+				)
 			}
 		}
 	}
